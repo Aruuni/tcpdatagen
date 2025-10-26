@@ -36,6 +36,8 @@ using namespace std;
 pthread_mutex_t lockit;
 #include <unistd.h>
 #include <math.h>
+#include <algorithm>  // for std::max
+#include <cmath>      // for std::exp
 #include <time.h>
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h>
@@ -92,7 +94,7 @@ char *ssh_cmd;
 char *downlink;
 char *uplink;
 char *log_file;
-char *basetime_path;
+char *timestamp_start;
 char *path;
 char *congestion;
 int it=0;
@@ -100,16 +102,15 @@ bool got_message=0;
 int codel=0;
 int first_time=0;
 int min_thr=2;
-int qsize=100; //pkts
 int flow_index=0;
 int target_ratio=150;
 u32 target=50; //50ms
 u32 report_period=5;//5s
 double mm_loss_rate=0;
-int flows_num = 1;
+int flows_num = 0;
 int env_bw = 48;
 int bw2 = 48;
-int trace_period = 7;
+int bw2_flip_period = 7;
 
 #define FLOW_NUM 1
 int sock[FLOW_NUM];
@@ -626,3 +627,41 @@ class dq_sage {
         }
 };
 
+struct WindowedGradient {
+    size_t cap;
+    std::deque<std::pair<double,double>> q; // (t_sec, rtt_ms)
+    double sum_t = 0.0, sum_r = 0.0, sum_tt = 0.0, sum_tr = 0.0;
+
+    explicit WindowedGradient(size_t n) : cap(n) {}
+
+    void add(double t_sec, double rtt_ms) {
+        q.emplace_back(t_sec, rtt_ms);
+        sum_t  += t_sec;
+        sum_r  += rtt_ms;
+        sum_tt += t_sec * t_sec;
+        sum_tr += t_sec * rtt_ms;
+
+        while (q.size() > cap) {
+            auto [ot, orr] = q.front(); q.pop_front();
+            sum_t  -= ot;
+            sum_r  -= orr;
+            sum_tt -= ot * ot;
+            sum_tr -= ot * orr;
+        }
+    }
+
+    bool ready() const { return q.size() >= 2; }
+
+    // Least-squares slope of RTT vs time over the window:
+    //   slope = d(RTT)/dt  (ms per second if inputs are ms, sec)
+    double slope_ms_per_s() const {
+        const double n = (double)q.size();
+        const double denom = n * sum_tt - sum_t * sum_t;
+        if (denom <= 0.0) return 0.0;
+        return (n * sum_tr - sum_t * sum_r) / denom;
+    }
+
+    double avg_rtt_ms() const {
+        return q.empty() ? 0.0 : sum_r / (double)q.size();
+    }
+};

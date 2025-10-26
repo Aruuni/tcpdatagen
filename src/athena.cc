@@ -27,7 +27,7 @@
 
 #include <cstdlib>
 #include <sys/select.h>
-
+#include <algorithm>
 #include "define.h"
 
 #define FLOORING 0
@@ -55,6 +55,11 @@
 #define STEPS_UPDATE_MAX_CWND_EFF 10
 #define MAX_CWND_EFF_INIT 100
 #define BW_NORM_FACTOR 100     //100 Mbps will be used to normalize throughput signal
+#define MAX_FLOW_INTERVALS 128
+
+int flow_interval[MAX_FLOW_INTERVALS];
+int flow_interval_len = 0;
+int next_join_idx = 0;
 
 FILE *testing_;
 enum fsm{
@@ -62,14 +67,13 @@ enum fsm{
     state_Fair=2
 };
 fsm cc_state=state_DRL;
-int save=1;
 u32 iterations=0;
 u64 send_begun;
+
 int main(int argc, char **argv)
 {
     DBGPRINT(DBGSERVER,4,"Main\n");
-    //if(argc!=9)
-    if(argc!=20)
+    if(argc!=12)
 	{
         DBGERROR("argc:%d\n",argc);
         for(int i=0;i<argc;i++)
@@ -79,40 +83,45 @@ int main(int argc, char **argv)
 	}
 
     srand(raw_timestamp());
-
 	signal(SIGSEGV, handler);   // install our handler
 	signal(SIGTERM, handler);   // install our handler
 	signal(SIGABRT, handler);   // install our handler
 	signal(SIGFPE, handler);   // install our handler
     signal(SIGKILL,handler);   // install our handler
-    int flow_num;
-	flow_num=FLOW_NUM;
-	client_port=atoi(argv[1]);
-    path=argv[2];
-    save=atoi(argv[3]);
-    flows_num=atoi(argv[4]);
-    qsize=100;//;atoi(argv[8]);
-    report_period=10; //atoi(argv[5]);
-	codel=2;//atoi(argv[10]);
-   	env_bw=atoi(argv[5]);
-    first_time=atoi(argv[6]);
-    scheme=argv[7];//"pure";
-    actor_id=atoi(argv[8]);
 
-    downlink=argv[9];
-    uplink=argv[10];
-    delay_ms=atoi(argv[11]);
-    log_file=argv[12];
-    duration=atoi(argv[13]);
-    mm_loss_rate=atof(argv[14]); 
-    qsize=atoi(argv[15]);
-    duration_steps=atoi(argv[16]);
-    basetime_path=argv[17];
-    bw2=atoi(argv[18]);
-    trace_period=atoi(argv[19]);
+	client_port=atoi(argv[1]);
+    {
+        char *arg_copy = strdup(argv[2]);  // make a mutable copy
+        if (!arg_copy) {
+            DBGERROR("strdup failed for flow_interval arg\n");
+            return 0;
+        }
+        char *tok = strtok(arg_copy, ",");
+        while (tok && flow_interval_len < MAX_FLOW_INTERVALS) {
+            flow_interval[flow_interval_len++] = atoi(tok);
+            tok = strtok(NULL, ",");
+        }
+        free(arg_copy);
+        if (flow_interval_len == 0) {
+            DBGERROR("flow_interval argument is empty or invalid (argv[4])\n");
+        }
+        DBGPRINT(DBGSERVER,4,"Parsed %d flow_interval values\n", flow_interval_len);
+    }
+   	env_bw=atoi(argv[3]);
+    scheme=argv[4];
+    delay_ms=atoi(argv[5]);
+    log_file=argv[6];
+    duration=atoi(argv[7]);
+    mm_loss_rate=atof(argv[8]); 
+    timestamp_start=argv[9];
+    bw2=atoi(argv[10]);
+    bw2_flip_period=atoi(argv[11]); // period that flips between bw and bw2
+    printf("flow_interval (%d): ", flow_interval_len);
+    for (int i = 0; i < flow_interval_len; i++) printf("%d ", flow_interval[i]);
+    printf("\n");
 
 	DBGPRINT(DBGSERVER,5,"********************************************************\n starting the server ...\n");
-    start_server(flow_num, client_port);
+    start_server(FLOW_NUM, client_port);
     return 0;
 }
 
@@ -143,7 +152,6 @@ void start_server(int flow_num, int client_port)
 	struct sockaddr_in server_addr[FLOW_NUM];
 	//Client address
 	struct sockaddr_in client_addr[FLOW_NUM];
-	//Controller address
 
     for(int i=0;i<FLOW_NUM;i++)
     {
@@ -181,7 +189,6 @@ void start_server(int flow_num, int client_port)
                 return;
             } 
         }
-
     }
 
     
@@ -200,27 +207,8 @@ void start_server(int flow_num, int client_port)
     char *save_ptr;
     int signal_check_counter=0;
     
-    initial_timestamp();
-    //Give Mahimahi enough time to write the BaseTimestamp to the file! ;)
-    // usleep(500000);
-    FILE *filep;
-    char line[4096];
-    char basetime_file_name[1000];
-    sprintf(basetime_file_name,"%s",basetime_path);
-    if((filep=fopen(basetime_file_name,"r"))==NULL)
-    {
-        DBGERROR("<basetime> file doesn't exist! You haven't patched Mahimahi dude!\n");
-		start_timestamp = 0;
-        return;
-    }
-	else
-	{
-    	fgets(line, sizeof(line), filep);
-    	sscanf(line, "%" SCNu64, &start_timestamp);
-		fclose(filep);
-	}
-
-    //Start listen
+    start_timestamp = strtoull(timestamp_start, NULL, 10);
+    std::cout<<"BaseTimeStamp:"<<start_timestamp<<std::endl;
     int maxfdp=-1;
     fd_set rset; 
     FD_ZERO(&rset);
@@ -283,7 +271,6 @@ void start_server(int flow_num, int client_port)
                       
                 if (flow_index==0)
                 {
-                    
                     if(pthread_create(&cnt_thread, NULL , CntThread, (void*)info) < 0)
                     {
                         DBGERROR("could not create control thread\n");
@@ -297,9 +284,7 @@ void start_server(int flow_num, int client_port)
                         close(sock[flow_index]);
                         return;
                     } 
-                    ;
                 }
-                
             DBGERROR("(Actor %d) Server is Connected to the client...\n",actor_id);
             flow_index++;
         }
@@ -318,9 +303,7 @@ void* TimerThread(void* information)
             sleep(1);
             elapsed=(unsigned int)((timestamp()-start)/1000000);      //unit s
             if (elapsed>duration)    
-            {
                 send_traffic=false;
-            }
         }
     }
 
@@ -328,22 +311,6 @@ void* TimerThread(void* information)
 }
 void* CntThread(void* information)
 {
-//    printf("testing\n");
-/*    struct sched_param param;
-    param.__sched_priority=sched_get_priority_max(SCHED_RR);
-    int policy=SCHED_RR;
-    int s = pthread_setschedparam(pthread_self(), policy, &param);
-    if (s!=0)
-    {
-        DBGERROR("Cannot set priority (%d) for the Main: %s\n",param.__sched_priority,strerror(errno));
-    }
-
-    s = pthread_getschedparam(pthread_self(),&policy,&param);
-    if (s!=0)
-    {
-        DBGERROR("Cannot get priority for the Data thread: %s\n",strerror(errno));
-    }
-    */
 	int ret1;
     double min_rtt_=0.0;
     double pacing_rate=0.0;
@@ -387,7 +354,7 @@ void* CntThread(void* information)
     int fairness_phase_cnt=0;
 
     char file_name[1000];
-    sprintf(file_name,"%s/../dataset/%s_%s_cwnd.txt",path,scheme,log_file);
+    sprintf(file_name,"%s.txt",log_file);
     ofstream measurement_file(file_name);
 
     DBGERROR("********************************* fileName:%s\n",file_name);
@@ -415,11 +382,11 @@ void* CntThread(void* information)
     dq_sage<double> rtt_m(MID_WIN);
     dq_sage<double> rtt_l(LONG_WIN);
     
-    dq_sage<double> lost_s(SHORT_WIN);      //x = lost pkts / 1000
+    dq_sage<double> lost_s(SHORT_WIN); 
     dq_sage<double> lost_m(MID_WIN);
     dq_sage<double> lost_l(LONG_WIN);
 
-    dq_sage<double> inflight_s(SHORT_WIN); // x = inflight pkts / 1000
+    dq_sage<double> inflight_s(SHORT_WIN);
     dq_sage<double> inflight_m(MID_WIN);
     dq_sage<double> inflight_l(LONG_WIN);
     
@@ -430,6 +397,10 @@ void* CntThread(void* information)
     dq_sage<double> thr_s(SHORT_WIN);
     dq_sage<double> thr_m(MID_WIN);
     dq_sage<double> thr_l(LONG_WIN);
+
+    static WindowedGradient wg_s(SHORT_WIN);
+    static WindowedGradient wg_m(MID_WIN);
+    static WindowedGradient wg_l(LONG_WIN);
 
     dq_sage<double> rtt_rate_s(SHORT_WIN);
     dq_sage<double> rtt_rate_m(MID_WIN);
@@ -496,6 +467,9 @@ void* CntThread(void* information)
                     //if(sage_info.bytes_sent-pre_bytes_sent>0)
                     if (bytes_acked_>0 || d_db>0)
                     {
+                        double rtt_grad_s_norm = 0.0;
+                        double rtt_grad_m_norm = 0.0;
+                        double rtt_grad_l_norm = 0.0;
                         dt = timestamp()- dt_pre;
                         dt = (dt>0)?dt:1;
                         dt_pre = timestamp();
@@ -589,14 +563,12 @@ void* CntThread(void* information)
                              pre_lost_packets = 0;
                              real_lost_rate = 0;
                         }
+
                         if(pre_max_delivary_rate>0)
-                        {
                             delta_max_rate = (double) max_delivary_rate/pre_max_delivary_rate;
-                        }
                         else
-                        {
                             delta_max_rate = 0;
-                        }
+
                         pre_max_delivary_rate = max_delivary_rate;
               
                         if(sage_info.rtt>0)
@@ -605,15 +577,44 @@ void* CntThread(void* information)
 
                             sending_rates.add((u64)sending_rate);
                             max_sending_rate = sending_rates.max();
-                            rtt_rate = (double)min_rtt_us/sage_info.rtt;
-                            time_delta = (1000000*time_delta)/sage_info.min_rtt;
-                            acked_rate = acked_rate/max_sending_rate;
+
+                            // ---- Windowed RTT gradients (short/med/long) ----
+                            double t_sec  = (double)timestamp() / 1e6;
+                            double rtt_ms = (double)sage_info.rtt / 1000.0;
+
+                            wg_s.add(t_sec, rtt_ms);
+                            wg_m.add(t_sec, rtt_ms);
+                            wg_l.add(t_sec, rtt_ms);
+
+                            double grad_s = wg_s.ready() ? wg_s.slope_ms_per_s() : 0.0;
+                            double grad_m = wg_m.ready() ? wg_m.slope_ms_per_s() : 0.0;
+                            double grad_l = wg_l.ready() ? wg_l.slope_ms_per_s() : 0.0;
+
+                            // Normalize each by its window mean to make it scale-free (1/s)
+                            auto norm = [](double slope_ms_per_s, double mean_ms) {
+                                if (mean_ms <= 0.0) return 0.0;
+                                return slope_ms_per_s / mean_ms;
+                            };
+                            rtt_grad_s_norm = wg_s.ready() ? norm(grad_s, wg_s.avg_rtt_ms()) : 0.0;
+                            rtt_grad_m_norm = wg_m.ready() ? norm(grad_m, wg_m.avg_rtt_ms()) : 0.0;
+                            rtt_grad_l_norm = wg_l.ready() ? norm(grad_l, wg_l.avg_rtt_ms()) : 0.0;
+
+                            // Keep using the existing rtt_rate scalar for compatibility.
+                            // Choose which one to expose as the single scalar; short is responsive:
+                            rtt_rate = rtt_grad_s_norm;
+                            time_delta = (1000000*time_delta)/std::max((u32)1, sage_info.min_rtt);
+                            acked_rate = (max_sending_rate>0)?(acked_rate/max_sending_rate):0.0;
                         }
                         else{
                             time_delta =report_period;
                             sending_rate = 0;
                             rtt_rate = 0.0;
+
+                            rtt_grad_s_norm = 0.0;
+                            rtt_grad_m_norm = 0.0;
+                            rtt_grad_l_norm = 0.0;
                         }
+
 
                         double diff_rate ;
                         if (max_sending_rate>0)
@@ -656,28 +657,59 @@ void* CntThread(void* information)
                         if(cwnd_bits==0)
                             cwnd_bits++;
 
-//-------------------------------------------------------- Reward Calculation --------------------------------------------------------
+                        //----------------- Reward Calculation ----------------------------------------
                         //FIXME: Reward should be a function of time:
                         int time_on_trace = (int)(raw_timestamp()/1000-start_timestamp);
-                        int time_on_trace_indx = ((time_on_trace/1000)%(trace_period*2))/(trace_period);
+                        int time_on_trace_indx = ((time_on_trace/1000)%(bw2_flip_period*2))/(bw2_flip_period);
                         int bw1 = env_bw;
                         int bw_current_max = (time_on_trace_indx)?bw2:env_bw;
                         double max_tmp = (double)bw_current_max;
                         double bw_true_value = dr_w_mbps;
-                        if (flows_num==1)
+                        if (next_join_idx < flow_interval_len && flow_interval[next_join_idx] <= time_on_trace)
                         {
-                            double rtt_rate_tmp=(rtt_rate>=0.8)?1:rtt_rate; 
+                            flows_num++;
+                            next_join_idx++;
+                            std::cout<<"Time:"<<time_on_trace<<", New Flow Joined! Total Flows="<<flows_num<<std::endl;
+                        }
+                        if (flows_num==1)
+                        {   
+                            // --- Gradient (g>0 = RTT rising, g<0 = draining) ---
+                            double g  = 0.7*rtt_grad_s_norm + 0.3*rtt_grad_m_norm;
+
+                            // 1) Dead-band (ignore tiny jitter)
+                            const double EPS = 0.01;
+                            double gp = std::max(0.0,  g - EPS);  // excess positive slope (queue building)
+                            double gn = std::max(0.0, -g - EPS);  // excess negative slope (draining)
+
+                            // 2) Smooth shaping (Huber): gentle near zero, linear when larger
+                            const double DELTA = 0.05;
+                            auto huber = [&](double a){
+                                return (a <= DELTA) ? 0.5*(a*a)/DELTA : (a - 0.5*DELTA);
+                            };
+                            double cost_p = huber(gp);   // “bad” (growth) magnitude
+                            double cost_n = huber(gn);   // “good” (drain) magnitude
+
+                            // 3) Multiplicative RTT factor around 1
+                            //    KP: punish growth; KN: reward draining
+                            const double KP = 4.0;   // harsher on increasing RTT
+                            const double KN = 1.05;   // milder boost for draining
+                            double rtt_factor = std::exp( KN*cost_n - KP*cost_p );
+
+                            // Clamp for stability (tune as needed)
+                            rtt_factor = std::clamp(rtt_factor, 0.4, 1.4);
+
                             int signof_bw=1;
                             if(dr_w_mbps<2*l_w_mbps) 
-                            {
-                                signof_bw=-1;
-                            }
-
-                            if(bw_true_value>(bw_current_max))          //transition to low value (e.g. as in 2x-d)
-                            {
-                                bw_true_value = bw_current_max*0.9;                           
-                            }
-                            reward = signof_bw*(25*(bw_true_value-2*l_w_mbps)*(bw_true_value-2*l_w_mbps))/(max_tmp*max_tmp)*rtt_rate_tmp;                          
+                            signof_bw=-1;
+                            
+                            if(bw_true_value>(bw_current_max))          // transition to low value (e.g., as in 2x-d)
+                            bw_true_value = bw_current_max*0.9;
+                            
+                            // your original bandwidth reward (unchanged)
+                            double bw_reward = signof_bw * (25*(bw_true_value-2*l_w_mbps)*(bw_true_value-2*l_w_mbps)) / (max_tmp*max_tmp);
+                            
+                            // final: bandwidth reward * RTT-gradient gate
+                            reward = bw_reward * rtt_factor;
                         }
                         else
                         {
@@ -705,9 +737,14 @@ void* CntThread(void* information)
                         rtt_m.add((double)sage_info.rtt/100000);
                         rtt_l.add((double)sage_info.rtt/100000);
                         
-                        rtt_rate_s.add(rtt_rate);
-                        rtt_rate_m.add(rtt_rate);
-                        rtt_rate_l.add(rtt_rate);
+                        // rtt_rate_s.add(rtt_rate);
+                        // rtt_rate_m.add(rtt_rate);
+                        // rtt_rate_l.add(rtt_rate);
+
+
+                        rtt_rate_s.add(rtt_grad_s_norm);
+                        rtt_rate_m.add(rtt_grad_m_norm);
+                        rtt_rate_l.add(rtt_grad_l_norm);
 
                         rtt_var_s.add((double)sage_info.rttvar/1000.0);
                         rtt_var_m.add((double)sage_info.rttvar/1000.0);
@@ -726,8 +763,7 @@ void* CntThread(void* information)
                         lost_l.add((double)sage_info.lost/100.0);
 
                        char message_extra[1000];
-                       sprintf(message_extra,
-                               "     %.7f %.7f %.7f %.7f   %.7f %.7f    %d %u    %.7f %.7f %.7f   %.7f %.7f %.7f   %.7f %.7f %.7f    %.7f %.7f %.7f    %.7f %.7f %.7f    %.7f %.7f %.7f    %.7f %.7f %.7f   %.7f %.7f %.7f   %.7f %.7f %.7f    %.7f %.7f %.7f    %.7f %.7f %.7f    %.7f %.7f %.7f     %.7f %.7f %.7f    %.7f %.7f %.7f    %.7f %.7f %.7f       %.7f %.7f %.7f    %.7f %.7f %.7f    %.7f %.7f %.7f                     ",
+                       sprintf(message_extra,"     %.7f %.7f %.7f %.7f   %.7f %.7f    %d %u    %.7f %.7f %.7f   %.7f %.7f %.7f   %.7f %.7f %.7f    %.7f %.7f %.7f    %.7f %.7f %.7f    %.7f %.7f %.7f    %.7f %.7f %.7f   %.7f %.7f %.7f   %.7f %.7f %.7f    %.7f %.7f %.7f    %.7f %.7f %.7f    %.7f %.7f %.7f     %.7f %.7f %.7f    %.7f %.7f %.7f    %.7f %.7f %.7f       %.7f %.7f %.7f    %.7f %.7f %.7f    %.7f %.7f %.7f                     ",
                                
                                //2
                                (double)sage_info.rtt/100000.0, /*sRTT in 100x (ms):e.g. 2 = 2x100=200 ms*/
@@ -829,22 +865,6 @@ void* CntThread(void* information)
 }
 void* DataThread(void* info)
 {
-    /*
-	struct sched_param param;
-    param.__sched_priority=sched_get_priority_max(SCHED_RR);
-    int policy=SCHED_RR;
-    int s = pthread_setschedparam(pthread_self(), policy, &param);
-    if (s!=0)
-    {
-        DBGERROR("Cannot set priority (%d) for the Main: %s\n",param.__sched_priority,strerror(errno));
-    }
-
-    s = pthread_getschedparam(pthread_self(),&policy,&param);
-    if (s!=0)
-    {
-        DBGERROR("Cannot get priority for the Data thread: %s\n",strerror(errno));
-    }*/
-
 	cFlow* flow = (cFlow*)info;
 	int sock_local = flow->flowinfo.sock;
 	char* src_ip;
@@ -929,9 +949,7 @@ void* DataThread(void* info)
 		while(len>0)
 		{
 			DBGMARK(DBGSERVER,7,"++++++%d\n",send_traffic);
-			len-=send(sock_local,write_message,strlen(write_message),0);
-		    //usleep(50);         
-            usleep(1);         
+			len-=send(sock_local,write_message,strlen(write_message),0);             
             DBGMARK(DBGSERVER,7,"      ------\n");
 		}
         //usleep(100);
